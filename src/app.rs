@@ -3,6 +3,7 @@
 
 use crate::{gpu, input, Runtime};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -25,7 +26,35 @@ struct App {
     launcher_shown: bool,
     locked: bool,
     mods: ModifiersState,
+    q_held: bool,
+    quit_started: Option<Instant>,
     wheel_accum: f64,
+}
+
+fn quit_deadline(started: &mut Option<Instant>, held: bool, now: Instant) -> Option<Instant> {
+    if held { Some(*started.get_or_insert(now) + Duration::from_secs(1)) }
+    else { *started = None; None }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_instant_quit_shortcut() {
+    use objc2::{class, msg_send, sel, runtime::{AnyObject, Sel}};
+    use objc2_foundation::NSString;
+    // AppKit's menu shortcut would quit before the hold timer sees Cmd+Q.
+    unsafe {
+        let app: &AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let Some(menu): Option<&AnyObject> = msg_send![app, mainMenu] else { return };
+        let Some(item): Option<&AnyObject> = msg_send![menu, itemAtIndex: 0isize] else { return };
+        let Some(menu): Option<&AnyObject> = msg_send![item, submenu] else { return };
+        let count: isize = msg_send![menu, numberOfItems];
+        for i in 0..count {
+            let item: &AnyObject = msg_send![menu, itemAtIndex: i];
+            let action: Option<Sel> = msg_send![item, action];
+            if action == Some(sel!(terminate:)) {
+                let _: () = msg_send![item, setKeyEquivalent: &*NSString::from_str("")];
+            }
+        }
+    }
 }
 
 fn backbuffer_size(window: &Window) -> (i32, i32) {
@@ -50,6 +79,8 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        #[cfg(target_os = "macos")]
+        remove_instant_quit_shortcut();
         let attrs = Window::default_attributes()
             .with_title(if self.args.iter().any(|a| a.starts_with("-wasmstartchoice")) || std::env::var("MUGUET_START").map(|v| v != "0").unwrap_or(false) { TITLE } else { PICK_TITLE })
             .with_inner_size(LogicalSize::new(1280.0, 720.0));
@@ -82,6 +113,8 @@ impl ApplicationHandler for App {
     }
 
     fn suspended(&mut self, _el: &ActiveEventLoop) {
+        self.q_held = false;
+        self.quit_started = None;
         gpu::SUSPENDED.store(true, std::sync::atomic::Ordering::Relaxed);
         input::set_focus(false);
         #[cfg(target_os = "ios")]
@@ -104,10 +137,21 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(f) => {
                 input::set_focus(f);
-                if !f { self.unlock(&window); }
+                if !f {
+                    self.q_held = false;
+                    self.quit_started = None;
+                    self.unlock(&window);
+                }
             }
-            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.mods = m.state();
+                if !self.mods.super_key() { self.quit_started = None; }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
+                if event.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::KeyQ) {
+                    self.q_held = event.state == ElementState::Pressed;
+                    if !self.q_held { self.quit_started = None; }
+                }
                 if !self.mode_chosen && input::start_mode() != 0 {
                     self.mode_chosen = true;
                     window.set_title(TITLE);
@@ -115,8 +159,7 @@ impl ApplicationHandler for App {
 
                 if self.mods.super_key() {
                     if let PhysicalKey::Code(winit::keyboard::KeyCode::KeyQ) = event.physical_key {
-                        crate::mp::shutdown();
-                        std::process::exit(0);
+                        return;
                     }
 
                     if let PhysicalKey::Code(winit::keyboard::KeyCode::KeyF) = event.physical_key {
@@ -167,7 +210,16 @@ impl ApplicationHandler for App {
             self.launcher();
             wait = 50;
         }
-        el.set_control_flow(ControlFlow::WaitUntil(std::time::Instant::now() + std::time::Duration::from_millis(wait)));
+        let now = Instant::now();
+        let mut wake = now + Duration::from_millis(wait);
+        if let Some(deadline) = quit_deadline(&mut self.quit_started, self.q_held && self.mods.super_key(), now) {
+            if now >= deadline {
+                crate::mp::shutdown();
+                std::process::exit(0);
+            }
+            wake = wake.min(deadline);
+        }
+        el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
@@ -264,7 +316,25 @@ impl App {
 pub fn run(rt: Option<Arc<Runtime>>, startup: crate::config::Startup, args: Vec<String>) -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { mode_chosen: false, rt, startup, args, window: None, started: false, launcher_shown: false, locked: false, mods: ModifiersState::empty(), wheel_accum: 0.0 };
+    let mut app = App { mode_chosen: false, rt, startup, args, window: None, started: false, launcher_shown: false, locked: false, mods: ModifiersState::empty(), q_held: false, quit_started: None, wheel_accum: 0.0 };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_requires_an_uninterrupted_one_second_hold() {
+        let now = Instant::now();
+        let mut started = None;
+        let deadline = now + Duration::from_secs(1);
+        assert_eq!(quit_deadline(&mut started, true, now), Some(deadline));
+        // Key repeats do not restart the countdown.
+        assert_eq!(quit_deadline(&mut started, true, now + Duration::from_millis(500)), Some(deadline));
+        assert_eq!(quit_deadline(&mut started, false, now + Duration::from_millis(600)), None);
+        assert_eq!(started, None);
+        assert_eq!(quit_deadline(&mut started, true, deadline), Some(deadline + Duration::from_secs(1)));
+    }
 }

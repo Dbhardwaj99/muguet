@@ -53,6 +53,22 @@ fn now_ms() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
 }
 
+fn module_int(name: &str, default: i64) -> i64 {
+    // Movie cleanup waits for AsyncBink; keep its worker even without a video decoder.
+    if name == "keepThreads" { default | 4 } else { default }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn movie_worker_is_kept_without_enabling_other_thread_groups() {
+        assert_eq!(super::module_int("keepThreads", 0), 4);
+        assert_eq!(super::module_int("keepThreads", 2), 6);
+        assert_eq!(super::module_int("keepThreads", -1), -1);
+        assert_eq!(super::module_int("otherSetting", 2), 2);
+    }
+}
+
 fn export_call(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val]) -> Result<Vec<Val>> {
     let f = caller
         .get_export(name)
@@ -182,7 +198,7 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         "wasm_print_line_js" | "wasm_hang_line_js" => {
             eprintln!("[eng] {}", read_cstr(mem, int(params, 0) as u64));
         }
-        "wasm_module_int_js" => set_int(results, int(params, 1)),
+        "wasm_module_int_js" => set_int(results, module_int(&read_cstr(mem, int(params, 0) as u64), int(params, 1))),
         "wasm_has_page_js" => set_int(results, 1),
         "wasm_userdata_page_js" => set_int(results, 0),
         "wasm_userdata_put_js" | "wasm_userdata_delete_js" => {}

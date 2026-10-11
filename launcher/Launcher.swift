@@ -201,7 +201,7 @@ struct LauncherView: View {
             .controlSize(.large)
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.defaultAction)
-            Text("In game: Cmd+F fullscreen · Cmd+any key releases the mouse · Cmd+Q quits")
+            Text("In game: Cmd+F fullscreen · Cmd+any key releases the mouse · Hold Cmd+Q for 1s to quit")
                 .font(.caption).foregroundStyle(.secondary)
             Text("The first start compiles the game for this Mac (about a minute).")
                 .font(.caption).foregroundStyle(.secondary)
