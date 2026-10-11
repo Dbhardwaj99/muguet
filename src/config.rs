@@ -35,7 +35,9 @@ fn support_dir() -> PathBuf {
 }
 
 pub fn game_dir() -> PathBuf {
-    support_dir().join("game")
+    let dir = support_dir().join("game");
+    let old = dir.join("gamedat");
+    if !dir.join("data").exists() && old.join("data/manifest.json").exists() { old } else { dir }
 }
 
 pub fn game_ready() -> bool {
@@ -161,19 +163,29 @@ fn settings(cfg_path: &Path) -> Vec<String> {
     if let Some(extra) = cfg.get("extra_args").and_then(|v| v.as_array()) {
         engine_args.extend(extra.iter().filter_map(|a| a.as_str().map(String::from)));
     }
-    if let Some(q) = num("texture_quality") {
-        set_texture_quality(q as i64);
-    }
+    fix_settings(num("texture_quality").map(|q| q as i64));
     engine_args
 }
 
-fn set_texture_quality(q: i64) {
+fn fix_settings(texture_quality: Option<i64>) {
     let path = support_dir().join("saves/userdata/Documents/Rockstar Games/GTA V/settings.xml");
     let Ok(xml) = std::fs::read_to_string(&path) else { return };
-    let re = regex::Regex::new(r#"<TextureQuality value="\d+" />"#).unwrap();
-    let new = re.replace(&xml, format!(r#"<TextureQuality value="{}" />"#, q.clamp(0, 2)).as_str());
+    let mut new = xml.clone();
+    let mut set = |tag: &str, fix: &dyn Fn(i64) -> i64| {
+        let re = regex::Regex::new(&format!(r#"<{tag} value="(\d+)" />"#)).unwrap();
+        let Some(v) = re.captures(&new).and_then(|c| c[1].parse::<i64>().ok()) else { return };
+        let to = fix(v);
+        if to != v {
+            new = re.replace(&new, format!(r#"<{tag} value="{to}" />"#).as_str()).into_owned();
+            eprintln!("[config] {tag} {v} -> {to}");
+        }
+    };
+    if let Some(q) = texture_quality {
+        set("TextureQuality", &|_| q.clamp(0, 2));
+    }
+    set("ShaderQuality", &|v| v.max(1));
+    set("MSAA", &|v| if v > 4 { v.min(crate::gpu::max_msaa() as i64) } else { v });
     if new != xml {
         let _ = std::fs::write(&path, new.as_bytes());
-        eprintln!("[config] texture quality set to {q}");
     }
 }

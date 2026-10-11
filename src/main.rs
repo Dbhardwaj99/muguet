@@ -125,9 +125,16 @@ fn main() -> Result<()> {
         config.target("aarch64-apple-ios").map_err(anyhow::Error::from)?;
         unsafe { config.cranelift_flag_enable("has_lse") };
         let engine = Engine::new(&config).map_err(anyhow::Error::from)?;
-        let patched = patch::patch(&std::fs::read(wasm)?, mp::COMMANDS)?;
+        let wasm_bytes = std::fs::read(wasm)?;
+        let patched = if patch::is_patched(&wasm_bytes) { wasm_bytes } else { patch::patch(&wasm_bytes, mp::COMMANDS)? };
         std::fs::write(out, engine.precompile_module(&patched).map_err(anyhow::Error::from)?)?;
         eprintln!("[host] precompiled {wasm} -> {out}");
+        return Ok(());
+    }
+    #[cfg(feature = "jit")]
+    if argv.get(1).map(String::as_str) == Some("--patch") {
+        let (wasm, out) = (argv.get(2).context("--patch <wasm> <out>")?, argv.get(3).context("--patch <wasm> <out>")?);
+        std::fs::write(out, patch::patch(&std::fs::read(wasm)?, mp::COMMANDS)?)?;
         return Ok(());
     }
     let startup = match config::setup() {
@@ -278,7 +285,7 @@ fn load_module(engine: &Engine, startup: &config::Startup) -> Result<Module> {
     let mp_key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (patch::VERSION, mp::COMMANDS).hash(&mut h);
+        (patch::VERSION, mp::COMMANDS, host::MISSING_TEXT).hash(&mut h);
         h.finish() as u32
     };
     let cache = startup.cache_dir.join(format!("game-{}-{stamp}-{mp_key:08x}.cwasm", meta.len()));

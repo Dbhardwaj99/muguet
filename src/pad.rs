@@ -6,7 +6,7 @@ use objc2_game_controller::{GCController, GCControllerButtonInput, GCExtendedGam
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -22,9 +22,11 @@ struct State {
     held: HashSet<&'static str>,
     buttons: u8,
     last: Instant,
+    down_since: Option<Instant>,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+const SWITCH_HOLD: Duration = Duration::from_millis(300);
 const STICK_DEADZONE: f32 = 0.3;
 const LOOK_DEADZONE: f32 = 0.12;
 
@@ -50,7 +52,7 @@ pub fn poll() -> bool {
         eprintln!("[pad] controller connected");
     }
     let mut guard = STATE.lock().unwrap();
-    let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now() });
+    let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None });
     let dt = st.last.elapsed().as_secs_f64().min(0.05);
     st.last = Instant::now();
 
@@ -87,7 +89,12 @@ pub fn poll() -> bool {
         if gp.rightThumbstickButton().is_some_and(|b| down(&b)) { keys.insert("KeyC"); }
         let dp = gp.dpad();
         if down(&dp.up()) { keys.insert("ArrowUp"); }
-        if down(&dp.down()) { keys.insert("ArrowDown"); }
+        if down(&dp.down()) {
+            let since = *st.down_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= SWITCH_HOLD { keys.insert("AltLeft"); } else { keys.insert("ArrowDown"); }
+        } else {
+            st.down_since = None;
+        }
         if down(&dp.left()) { keys.insert("ArrowLeft"); }
         if down(&dp.right()) { keys.insert("ArrowRight"); }
         if down(&gp.buttonMenu()) { keys.insert("Escape"); }

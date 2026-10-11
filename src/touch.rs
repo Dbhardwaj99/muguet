@@ -64,6 +64,7 @@ const BUTTONS: &[Spec] = &[
     b(TopLeft(30.0, 30.0), 22.0, Some(("PAUSE", KeyNav("Escape"))), Some(("PAUSE", KeyNav("Escape")))),
     b(TopLeft(84.0, 30.0), 22.0, Some(("PHONE", KeyNav("ArrowUp"))), Some(("PHONE", KeyNav("ArrowUp")))),
     b(TopLeft(138.0, 30.0), 22.0, Some(("MENU\nKEYS", NavToggle)), Some(("MENU\nKEYS", NavToggle))),
+    b(TopLeft(192.0, 30.0), 22.0, Some(("SWITCH", Key("AltLeft"))), Some(("SWITCH", Key("AltLeft")))),
     n(-135.0, "◀", "ArrowLeft"),
     n(-87.0, "▲", "ArrowUp"),
     n(-39.0, "▼", "ArrowDown"),
@@ -74,8 +75,12 @@ const BUTTONS: &[Spec] = &[
 
 const STICK_RADIUS: f64 = 58.0;
 const KNOB_RADIUS: f64 = 26.0;
+const SPRINT_REACH: f64 = 1.35;
 
 const LOOK_GAIN: f64 = 3.0;
+const WHEEL_DEADZONE: f64 = 10.0;
+const WHEEL_FULL: f64 = 45.0;
+const WHEEL_PUSH: f64 = 40.0;
 static TOUCH_SENS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| std::env::var("MUGUET_TOUCH_SENS").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0));
 
 const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(120);
@@ -83,7 +88,7 @@ const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(120);
 enum Grip {
     Stick { origin: (f64, f64), at: (f64, f64) },
     Look { last: (f64, f64) },
-    Button { idx: usize, last: (f64, f64) },
+    Button { idx: usize, start: (f64, f64), last: (f64, f64) },
 }
 
 struct Btn {
@@ -220,6 +225,14 @@ pub fn install(window: &Window) {
 }
 
 impl Overlay {
+    fn is_wheel(&self, idx: usize) -> bool {
+        match self.spec_act(idx).map(|(_, a)| a) {
+            Some(Key("Tab")) | Some(Key("AltLeft")) => true,
+            Some(Key("KeyQ")) => self.in_car,
+            _ => false,
+        }
+    }
+
     fn spec_act(&self, idx: usize) -> Option<(&'static str, Act)> {
         let s = &BUTTONS[idx];
         if s.nav && !self.nav { return None; }
@@ -263,7 +276,7 @@ impl Overlay {
         match t.phase {
             TouchPhase::Started => {
                 if let Some(idx) = self.button_at(p) {
-                    self.grips.insert(t.id, Grip::Button { idx, last: p });
+                    self.grips.insert(t.id, Grip::Button { idx, start: p, last: p });
                     match self.spec_act(idx).map(|(_, a)| a) {
                         Some(AimToggle) => self.aim_latched = !self.aim_latched,
                         Some(NavToggle) => { self.nav = !self.nav; self.relabel(); }
@@ -276,18 +289,22 @@ impl Overlay {
                     self.grips.insert(t.id, Grip::Look { last: p });
                 }
             }
-            TouchPhase::Moved => match self.grips.get_mut(&t.id) {
-                Some(Grip::Stick { at, .. }) => *at = p,
-                Some(Grip::Look { last }) | Some(Grip::Button { last, .. }) => {
-                    let (dx, dy) = (p.0 - last.0, p.1 - last.1);
-                    *last = p;
+            TouchPhase::Moved => {
+                let wheel = matches!(self.grips.get(&t.id), Some(Grip::Button { idx, .. }) if self.is_wheel(*idx));
+                match self.grips.get_mut(&t.id) {
+                    Some(Grip::Stick { at, .. }) => *at = p,
+                    Some(Grip::Button { last, .. }) if wheel => *last = p,
+                    Some(Grip::Look { last }) | Some(Grip::Button { last, .. }) => {
+                        let (dx, dy) = (p.0 - last.0, p.1 - last.1);
+                        *last = p;
 
-                    let speed = (dx * dx + dy * dy).sqrt();
-                    let gain = LOOK_GAIN * *TOUCH_SENS * (1.0 + (speed / 12.0).min(1.5));
-                    input::mouse_delta_f(dx * gain, dy * gain);
+                        let speed = (dx * dx + dy * dy).sqrt();
+                        let gain = LOOK_GAIN * *TOUCH_SENS * (1.0 + (speed / 12.0).min(1.5));
+                        input::mouse_delta_f(dx * gain, dy * gain);
+                    }
+                    None => {}
                 }
-                None => {}
-            },
+            }
             TouchPhase::Ended | TouchPhase::Cancelled => { self.grips.remove(&t.id); }
         }
         self.apply();
@@ -325,11 +342,14 @@ impl Overlay {
             } else {
                 if ny < -0.35 { keys.insert("KeyW"); }
                 if ny > 0.35 { keys.insert("KeyS"); }
-                if len > STICK_RADIUS * 0.95 { keys.insert("ShiftLeft"); }
             }
+            let sprint = !self.in_car && len > STICK_RADIUS * SPRINT_REACH;
+            if sprint { keys.insert("ShiftLeft"); }
+            set_alpha_bg(&self.stick_knob, if sprint { 0.65 } else { 0.3 });
             move_to(&self.stick_base, o);
             move_to(&self.stick_knob, (o.0 + dx, o.1 + dy));
         } else {
+            set_alpha_bg(&self.stick_knob, 0.3);
             move_to(&self.stick_base, self.stick_home);
             move_to(&self.stick_knob, self.stick_home);
         }
@@ -383,6 +403,21 @@ pub fn refresh() -> bool {
         let mut guard = cell.borrow_mut();
         let Some(o) = guard.as_mut() else { return false };
         if o.lingering { o.apply(); }
+        let mut wheeling = false;
+        for g in o.grips.values() {
+            if let Grip::Button { idx, start, last } = g {
+                if !o.is_wheel(*idx) {
+                    continue;
+                }
+                wheeling = true;
+                let (dx, dy) = (last.0 - start.0, last.1 - start.1);
+                let len = (dx * dx + dy * dy).sqrt();
+                if len > WHEEL_DEADZONE {
+                    let push = WHEEL_PUSH * ((len - WHEEL_DEADZONE) / WHEEL_FULL).min(1.0);
+                    input::mouse_delta_f(dx / len * push, dy / len * push);
+                }
+            }
+        }
         let hide = crate::pad::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
 
         if !hide { input::set_locked(true); }
@@ -400,7 +435,7 @@ pub fn refresh() -> bool {
             o.apply();
             o.relabel();
         }
-        o.lingering
+        o.lingering || wheeling
     })
 }
 

@@ -24,6 +24,7 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-game-controller = { version = "0.3", default-features = false, features = ["std", "GCController", "GCExtendedGamepad", "GCPhysicalInputProfile", "GCControllerElement", "GCControllerAxisInput", "GCControllerButtonInput", "GCControllerDirectionPad"] }
 wasmparser = { version = "0.258.3", optional = true }
 wasm-encoder = { version = "0.258.3", optional = true, features = ["wasmparser"] }
+bcdec_rs = "0.2.0"
 
 [features]
 default = ["jit"]

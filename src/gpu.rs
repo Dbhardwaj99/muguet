@@ -87,6 +87,109 @@ struct Fmt {
     format: TextureFormat,
     views: Vec<TextureFormat>,
     a8: bool,
+    bc: Option<TextureFormat>,
+}
+
+static BC_SOFT: AtomicBool = AtomicBool::new(false);
+static F32_HALF: AtomicBool = AtomicBool::new(false);
+static RE_VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@binding\((\d+)u?\)\s*var(?:<[^>]*>)?\s+(\w+)").unwrap());
+static RE_IDENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+").unwrap());
+
+fn samplers_paired_with(text: &str, textures: u128) -> u128 {
+    let names: HashMap<&str, u32> = RE_VAR.captures_iter(text).filter_map(|c| Some((c.get(2)?.as_str(), c[1].parse().ok()?))).collect();
+    let mut out = 0u128;
+    let idents: Vec<_> = RE_IDENT.find_iter(text).collect();
+    for w in idents.windows(2) {
+        if text[w[0].end()..w[1].start()].trim() != "," { continue; }
+        let (Some(&t), Some(&smp)) = (names.get(w[0].as_str()), names.get(w[1].as_str())) else { continue };
+        if t < 128 && textures & (1 << t) != 0 && smp < 128 { out |= 1 << smp; }
+    }
+    out
+}
+
+fn half_of(f: TextureFormat) -> Option<(TextureFormat, usize)> {
+    use TextureFormat as T;
+    match f {
+        T::R32Float => Some((T::R16Float, 1)),
+        T::Rg32Float => Some((T::Rg16Float, 2)),
+        T::Rgba32Float => Some((T::Rgba16Float, 4)),
+        _ => None,
+    }
+}
+
+fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff { return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 }; }
+    let e = exp - 127 + 15;
+    if e >= 0x1f { return sign | 0x7c00; }
+    if e <= 0 {
+        if e < -10 { return sign; }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = (m >> shift) as u16;
+        let round = (m >> (shift - 1)) & 1;
+        return sign | (half + round as u16);
+    }
+    let half = sign | ((e as u16) << 10) | (man >> 13) as u16;
+    half + ((man >> 12) & 1) as u16
+}
+
+fn bc_soft_format(f: TextureFormat) -> TextureFormat {
+    use TextureFormat as T;
+    match f {
+        T::Bc1RgbaUnormSrgb | T::Bc2RgbaUnormSrgb | T::Bc3RgbaUnormSrgb | T::Bc7RgbaUnormSrgb => T::Rgba8UnormSrgb,
+        T::Bc4RUnorm => T::R8Unorm,
+        T::Bc5RgUnorm => T::Rg8Unorm,
+        T::Bc6hRgbUfloat => T::Rgba16Float,
+        _ => T::Rgba8Unorm,
+    }
+}
+
+fn bc_decode(bc: TextureFormat, src: &[u8], bpr: u32, rows: u32, layers: u32, w: u32, h: u32) -> (Vec<u8>, u32) {
+    use TextureFormat as T;
+    let px = bc_soft_format(bc).block_copy_size(None).unwrap_or(4) as usize;
+    let block = bc.block_copy_size(None).unwrap_or(16) as usize;
+    let (bw, bh) = (w.div_ceil(4) as usize, h.div_ceil(4) as usize);
+    let (w, h) = (w as usize, h as usize);
+    let mut out = vec![0u8; w * h * px * layers as usize];
+    let mut tmp = [0u8; 4 * 4 * 8];
+    let mut half = [0u16; 4 * 4 * 3];
+    for l in 0..layers as usize {
+        for by in 0..bh {
+            for bx in 0..bw {
+                let o = (l * rows as usize + by) * bpr as usize + bx * block;
+                let Some(b) = src.get(o..o + block) else { continue };
+                match bc {
+                    T::Bc1RgbaUnorm | T::Bc1RgbaUnormSrgb => bcdec_rs::bc1(b, &mut tmp, 16),
+                    T::Bc2RgbaUnorm | T::Bc2RgbaUnormSrgb => bcdec_rs::bc2(b, &mut tmp, 16),
+                    T::Bc3RgbaUnorm | T::Bc3RgbaUnormSrgb => bcdec_rs::bc3(b, &mut tmp, 16),
+                    T::Bc4RUnorm => bcdec_rs::bc4(b, &mut tmp, 4, false),
+                    T::Bc5RgUnorm => bcdec_rs::bc5(b, &mut tmp, 8, false),
+                    T::Bc6hRgbUfloat => {
+                        bcdec_rs::bc6h_half(b, &mut half, 12, false);
+                        for i in 0..16 {
+                            for c in 0..4 {
+                                let v = if c < 3 { half[i * 3 + c] } else { 0x3c00 };
+                                tmp[i * 8 + c * 2..i * 8 + c * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                    }
+                    _ => bcdec_rs::bc7(b, &mut tmp, 16),
+                }
+                for r in 0..4 {
+                    let y = by * 4 + r;
+                    if y >= h { break; }
+                    let n = (w - bx * 4).min(4) * px;
+                    let d = ((l * h + y) * w + bx * 4) * px;
+                    out[d..d + n].copy_from_slice(&tmp[r * 4 * px..r * 4 * px + n]);
+                }
+            }
+        }
+    }
+    (out, (w * px) as u32)
 }
 fn map_format(f: u32, bind: u32) -> Fmt {
     use TextureFormat as T;
@@ -135,7 +238,10 @@ fn map_format(f: u32, bind: u32) -> Fmt {
             (T::Rgba8Unorm, vec![], false)
         }
     };
-    Fmt { format, views, a8 }
+    if format.is_compressed() && BC_SOFT.load(Ordering::Relaxed) {
+        return Fmt { format: bc_soft_format(format), views: views.into_iter().map(bc_soft_format).collect(), a8, bc: Some(format) };
+    }
+    Fmt { format, views, a8, bc: None }
 }
 
 fn is_depth(f: TextureFormat) -> bool {
@@ -433,11 +539,14 @@ struct Tex {
     format: TextureFormat,
     views: HashMap<(TextureFormat, u32, u32), TextureView>,
     a8: bool,
+    bc: Option<TextureFormat>,
+    half: usize,
     enc: u64,
     in_bg: bool,
     proxy_depth: Option<Proxy>,
     proxy_stencil: Option<Proxy>,
     proxy_fdepth: Option<Proxy>,
+    proxy_half: Option<Proxy>,
     blit_bg: Option<BindGroup>,
     mip_passes: Option<Vec<(TextureView, BindGroup)>>,
 }
@@ -680,6 +789,8 @@ pub struct Gpu {
     zero_src: Option<Buffer>,
     scratch: Option<Buffer>,
     proxy_pipelines: HashMap<&'static str, RenderPipeline>,
+    unfilt: HashMap<u64, (u128, u128)>,
+    nearest: HashMap<u32, Sampler>,
     f2d_pipeline: Option<RenderPipeline>,
     blit: Option<RenderPipeline>,
     mip_pipelines: HashMap<TextureFormat, RenderPipeline>,
@@ -720,6 +831,17 @@ pub struct Gpu {
 
 unsafe impl Send for Gpu {}
 
+pub fn max_msaa() -> u32 {
+    let mut d = InstanceDescriptor::new_without_display_handle();
+    d.backends = Backends::METAL;
+    let Ok(adapter) = pollster::block_on(Instance::new(d).request_adapter(&RequestAdapterOptions::default())) else { return 4 };
+    let formats = [TextureFormat::Rgba8Unorm, TextureFormat::Rgba16Float, TextureFormat::Rg11b10Ufloat, TextureFormat::Depth32FloatStencil8];
+    [16, 8, 4, 2]
+        .into_iter()
+        .find(|&n| formats.iter().all(|f| adapter.get_texture_format_features(*f).flags.sample_count_supported(n)))
+        .unwrap_or(1)
+}
+
 impl Gpu {
     fn new(mem: SharedMemory, ring: u64, _size: u64, dbg: u64, handoff: Option<SurfaceHandoff>) -> anyhow::Result<Gpu> {
         let (base, _) = mem_base_len(&mem);
@@ -739,6 +861,14 @@ impl Gpu {
 
             | Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let features = want & adapter.features();
+        if !features.contains(Features::FLOAT32_FILTERABLE) {
+            F32_HALF.store(true, Ordering::Relaxed);
+            log("this GPU can't filter 32-bit float textures: sampling them as 16-bit");
+        }
+        if !features.contains(Features::TEXTURE_COMPRESSION_BC) {
+            BC_SOFT.store(true, Ordering::Relaxed);
+            log("this GPU can't read BC textures: decoding them on the CPU");
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
             label: Some("muguet"),
             required_features: features,
@@ -803,7 +933,7 @@ impl Gpu {
             bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(), ubo_shared: Vec::new(), ubo_slot: 0, ubo_chunk: 0, ubo_off: 0,
             dummy_tex: HashMap::new(), dummy_smp: None, dummy_cmp: None, dummy_bufs: HashMap::new(), zero_vb: None, zero_src: None, scratch: None,
-            proxy_pipelines: HashMap::new(), f2d_pipeline: None, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
+            proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), f2d_pipeline: None, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
             frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
@@ -1142,7 +1272,15 @@ impl Gpu {
 
     #[allow(clippy::too_many_arguments)]
     fn create_texture(&mut self, id: u32, dim: u32, w: u32, h: u32, d: u32, mips: u32, array: u32, dxgi: u32, bind: u32, samples: u32) {
-        let m = map_format(dxgi, bind);
+        let mut m = map_format(dxgi, bind);
+        let mut half = 0;
+        if F32_HALF.load(Ordering::Relaxed) && bind & BIND_SRV != 0 && bind & BIND_UAV == 0 {
+            if let Some((h, n)) = half_of(m.format) {
+                m.format = h;
+                m.views.clear();
+                half = n;
+            }
+        }
         let mut usage = TextureUsages::COPY_SRC | TextureUsages::COPY_DST;
         if bind & BIND_SRV != 0 { usage |= TextureUsages::TEXTURE_BINDING; }
         if bind & (BIND_RT | BIND_DS) != 0 { usage |= TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING; }
@@ -1162,8 +1300,8 @@ impl Gpu {
         let tex = match self.scoped(&format!("createTexture id={id} dim={dim} {}x{}x{} mips={mips} dxgi={dxgi} bind=0x{bind:x} samples={samples} -> {:?} usage {:?}", size.width, size.height, size.depth_or_array_layers, m.format, usage), |d| d.create_texture(&desc)) { Some(t) => t, None => return };
         self.set_obj(id, Obj::Tex(Tex {
             tex, desc: TexDesc { w: size.width, h: size.height, d: size.depth_or_array_layers, mips: mips.max(1), samples, dim: dimension },
-            format: m.format, views: HashMap::new(), a8: m.a8, enc: 0, in_bg: false, proxy_depth: None, proxy_stencil: None,
-            proxy_fdepth: None, blit_bg: None, mip_passes: None,
+            format: m.format, views: HashMap::new(), a8: m.a8, bc: m.bc, half, enc: 0, in_bg: false, proxy_depth: None, proxy_stencil: None,
+            proxy_fdepth: None, proxy_half: None, blit_bg: None, mip_passes: None,
         }));
     }
 
@@ -1210,10 +1348,34 @@ impl Gpu {
         if self.used(id) { self.flush(); }
         let t = self.tex_mut(id).unwrap();
         if let Some(p) = t.proxy_fdepth.as_mut() { p.dirty = true; }
+        if let Some(p) = t.proxy_half.as_mut() { p.dirty = true; }
         let three = t.desc.dim == TextureDimension::D3;
-        let (tex, a8) = (t.tex.clone(), t.a8);
+        let (tex, a8, bc, half) = (t.tex.clone(), t.a8, t.bc, t.half);
         let mut data = self.bytes(data_addr, size).to_vec();
-        let mut bpr = bpr;
+        let (mut bpr, mut rows, mut w, mut h) = (bpr, rows, w, h);
+        if let Some(bc) = bc {
+            let m = tex.size().mip_level_size(mip, tex.dimension());
+            w = w.min(m.width.saturating_sub(x));
+            h = h.min(m.height.saturating_sub(y));
+            if w == 0 || h == 0 { return; }
+            (data, bpr) = bc_decode(bc, &data, bpr, rows.max(1), d.max(1), w, h);
+            rows = h;
+        }
+        if half != 0 {
+            let row = w as usize * half;
+            let layers = d.max(1) as usize;
+            let mut out = Vec::with_capacity(row * 2 * h as usize * layers);
+            for r in 0..h as usize * layers {
+                let src = ((r / h as usize) * rows.max(1) as usize + r % h as usize) * bpr as usize;
+                for i in 0..row {
+                    let v = data.get(src + i * 4..src + i * 4 + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0);
+                    out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+                }
+            }
+            data = out;
+            bpr = (row * 2) as u32;
+            rows = h;
+        }
         if a8 {
             let mut out = vec![0u8; (w * h * 4) as usize];
             for r in 0..h as usize {
@@ -1414,6 +1576,17 @@ impl Gpu {
         if m.is_none() && remap.is_none() { Some(ps.module.clone()) } else { m }
     }
 
+    fn layout_entry_masked(b: &Binding, stage: u32, mask: (u128, u128)) -> BindGroupLayoutEntry {
+        let mut e = Self::layout_entry(b, stage);
+        let bit = if b.binding < 128 { 1u128 << b.binding } else { 0 };
+        match &mut e.ty {
+            BindingType::Texture { sample_type: TextureSampleType::Float { filterable }, .. } if mask.0 & bit != 0 => *filterable = false,
+            BindingType::Sampler(t) if mask.1 & bit != 0 && *t == SamplerBindingType::Filtering => *t = SamplerBindingType::NonFiltering,
+            _ => {}
+        }
+        e
+    }
+
     fn layout_entry(b: &Binding, stage: u32) -> BindGroupLayoutEntry {
         let visibility = match stage { 0 => ShaderStages::VERTEX, 1 => ShaderStages::FRAGMENT, _ => ShaderStages::COMPUTE };
         let ty = match b.kind {
@@ -1439,9 +1612,10 @@ impl Gpu {
     }
 
     fn bgl_for(&mut self, prog: &Program, stage: u32, group: u32) -> (BindGroupLayout, u64) {
-        let key = (prog.label.clone() + "#" + &prog.uid.to_string(), stage, group);
+        let mask = self.unfilt.get(&prog.uid).copied().unwrap_or((0, 0));
+        let key = (format!("{}#{}#{:x}", prog.label, prog.uid, mask.0), stage, group);
         if let Some(b) = self.bgl_cache.get(&key) { return b.clone(); }
-        let entries: Vec<_> = prog.info.bindings.iter().filter(|b| b.group == group).map(|b| Self::layout_entry(b, stage)).collect();
+        let entries: Vec<_> = prog.info.bindings.iter().filter(|b| b.group == group).map(|b| Self::layout_entry_masked(b, stage, mask)).collect();
         let bgl = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: None, entries: &entries });
         let uid = self.uid();
         self.bgl_cache.insert(key, (bgl.clone(), uid));
@@ -1459,7 +1633,7 @@ impl Gpu {
     fn target_view(&mut self, id: u32, dxgi: u32, mip: u32, slice: u32) -> Option<(TextureView, TextureFormat)> {
         let t = self.tex(id)?;
         let fmt = if dxgi != 0 { map_format(dxgi, 0).format } else { t.format };
-        let fmt = if is_depth(t.format) { t.format } else { fmt };
+        let fmt = if is_depth(t.format) || t.half != 0 { t.format } else { fmt };
         if let Some(v) = t.views.get(&(fmt, mip, slice)) { return Some((v.clone(), fmt)); }
         let three = t.desc.dim == TextureDimension::D3;
         let tex = t.tex.clone();
@@ -1473,7 +1647,10 @@ impl Gpu {
     }
 
     fn mark_color_dirty(&mut self, id: u32) {
-        if let Some(t) = self.tex_mut(id) { if let Some(p) = t.proxy_fdepth.as_mut() { p.dirty = true; } }
+        if let Some(t) = self.tex_mut(id) {
+            if let Some(p) = t.proxy_fdepth.as_mut() { p.dirty = true; }
+            if let Some(p) = t.proxy_half.as_mut() { p.dirty = true; }
+        }
     }
     fn mark_depth_dirty(&mut self, id: u32) {
         if let Some(t) = self.tex_mut(id) {
@@ -1713,6 +1890,77 @@ impl Gpu {
         Some(out)
     }
 
+    fn needs_half(&self, format: TextureFormat, b: &Binding) -> bool {
+        b.sample == Sample::Float && F32_HALF.load(Ordering::Relaxed) && half_of(format).is_some()
+    }
+
+    fn half_proxy(&mut self, id: u32) -> Option<(Texture, TextureFormat)> {
+        self.materialize_clears(id);
+        let (desc, tex, format) = { let t = self.tex(id)?; (t.desc, t.tex.clone(), t.format) };
+        if desc.dim == TextureDimension::D3 || desc.samples > 1 { return None; }
+        let (half, _) = half_of(format)?;
+        let key: &'static str = match half { TextureFormat::R16Float => "half_r", TextureFormat::Rg16Float => "half_rg", _ => "half_rgba" };
+        if !self.proxy_pipelines.contains_key(key) {
+            let module = self.device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(
+                "@group(0) @binding(0) var src: texture_2d<f32>;
+                 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
+                 @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f { return textureLoad(src, vec2i(pos.xy), 0); }".into()) });
+            let bgl = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: None, entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::FRAGMENT, count: None,
+                ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: false }, view_dimension: TextureViewDimension::D2, multisampled: false },
+            }] });
+            let layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
+            let targets = [Some(ColorTargetState { format: half, blend: None, write_mask: ColorWrites::ALL })];
+            let pl = self.device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("half proxy"), layout: Some(&layout),
+                vertex: VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                primitive: PrimitiveState::default(), depth_stencil: None, multisample: MultisampleState::default(),
+                fragment: Some(FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &targets }),
+                multiview_mask: None, cache: None,
+            });
+            self.proxy_pipelines.insert(key, pl);
+        }
+        let pl = self.proxy_pipelines[key].clone();
+        let dev = self.device.clone();
+        let t = self.tex_mut(id).unwrap();
+        if t.proxy_half.is_none() {
+            let ptex = dev.create_texture(&TextureDescriptor {
+                label: None, size: Extent3d { width: desc.w, height: desc.h, depth_or_array_layers: desc.d }, mip_level_count: desc.mips, sample_count: 1,
+                dimension: TextureDimension::D2, format: half, usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+            });
+            let mut passes = Vec::new();
+            for mip in 0..desc.mips {
+                for layer in 0..desc.d {
+                    let src = tex.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2), base_mip_level: mip, mip_level_count: Some(1), base_array_layer: layer, array_layer_count: Some(1), ..Default::default() });
+                    let dst = ptex.create_view(&TextureViewDescriptor { base_mip_level: mip, mip_level_count: Some(1), base_array_layer: layer, array_layer_count: Some(1), dimension: Some(TextureViewDimension::D2), ..Default::default() });
+                    let bg = dev.create_bind_group(&BindGroupDescriptor { label: None, layout: &pl.get_bind_group_layout(0), entries: &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&src) }] });
+                    passes.push((dst, bg));
+                }
+            }
+            t.proxy_half = Some(Proxy { tex: ptex, format: half, dirty: true, passes });
+        }
+        let px = t.proxy_half.as_mut().unwrap();
+        let out = (px.tex.clone(), px.format);
+        if px.dirty {
+            px.dirty = false;
+            let passes: Vec<_> = px.passes.iter().map(|(v, b)| (v.clone(), b.clone())).collect();
+            self.end_pass();
+            let enc = self.encoder();
+            for (dst, bg) in &passes {
+                let mut p = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(RenderPassColorAttachment { view: dst, depth_slice: None, resolve_target: None, ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store } })],
+                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                });
+                p.set_pipeline(&pl);
+                p.set_bind_group(0, bg, &[]);
+                p.draw(0..3, 0..1);
+            }
+            self.use_tex(id);
+        }
+        Some(out)
+    }
+
     fn prepare_depth_proxies(&mut self, prog: &Program, stage: usize) {
         for b in prog.info.bindings.iter().filter(|b| b.kind == Kind::Texture) {
             let id = *self.s.srv[stage].get((b.binding as usize).wrapping_sub(32)).unwrap_or(&0);
@@ -1720,10 +1968,25 @@ impl Gpu {
             if v.is_buf { continue; }
             let res = v.res;
             let Some(t) = self.tex(res) else { continue };
-            if is_depth(t.format) && b.sample != Sample::Depth {
+            let (tformat, tdesc) = (t.format, t.desc);
+            let point = F32_HALF.load(Ordering::Relaxed) && b.sample == Sample::Float && b.binding < 128
+                && (is_depth(tformat) || (half_of(tformat).is_some() && (tdesc.dim == TextureDimension::D3 || tdesc.samples > 1)));
+            if point {
+                let mut m = self.unfilt.get(&prog.uid).copied().unwrap_or((0, 0));
+                if m.0 & (1 << b.binding) == 0 {
+                    m.0 |= 1 << b.binding;
+                    m.1 = samplers_paired_with(&prog.text, m.0);
+                    self.unfilt.insert(prog.uid, m);
+                    self.pdirty = true;
+                    self.last_pl = None;
+                }
+            }
+            if is_depth(tformat) && b.sample != Sample::Depth {
                 self.depth_proxy(res, b.sample == Sample::Uint);
-            } else if !is_depth(t.format) && b.sample == Sample::Depth {
+            } else if !is_depth(tformat) && b.sample == Sample::Depth {
                 self.float_to_depth_proxy(res);
+            } else if self.needs_half(tformat, b) {
+                self.half_proxy(res);
             }
         }
     }
@@ -1739,6 +2002,9 @@ impl Gpu {
         } else if !is_depth(tformat) && b.sample == Sample::Depth {
             proxied = true;
             self.float_to_depth_proxy(res)?
+        } else if self.needs_half(tformat, b) && desc.dim != TextureDimension::D3 && desc.samples == 1 {
+            proxied = true;
+            self.half_proxy(res)?
         } else {
             (self.tex(res)?.tex.clone(), tformat)
         };
@@ -1896,7 +2162,20 @@ impl Gpu {
                     let sid = *self.s.smp[stage].get((b.binding as usize).wrapping_sub(16)).unwrap_or(&0);
                     let want_cmp = b.kind == Kind::SamplerCmp;
                     let st = self.state(sid);
+                    let point = !want_cmp && b.binding < 128 && self.unfilt.get(&prog.uid).is_some_and(|m| m.1 & (1 << b.binding) != 0);
                     let s = match st.as_ref().and_then(|s| s.sampler.clone().filter(|_| ((s.words.first().copied().unwrap_or(0) & 0x80) != 0) == want_cmp)) {
+                        Some(_) if point => {
+                            key.push(sid as u64 | 1 << 40);
+                            let words = st.as_ref().unwrap().words.clone();
+                            let dev_smp = self.nearest.get(&sid).cloned();
+                            dev_smp.unwrap_or_else(|| {
+                                let mut w = words;
+                                if let Some(f) = w.first_mut() { *f &= !0x7f; }
+                                let smp = self.make_sampler(&w);
+                                self.nearest.insert(sid, smp.clone());
+                                smp
+                            })
+                        }
                         Some(s) => { key.push(sid as u64); s }
                         None => { key.push(0); self.dummy_sampler(want_cmp) }
                     };
@@ -2010,6 +2289,9 @@ impl Gpu {
         let (topo, strip) = topology(self.s.topo);
         let strip_fmt = if strip && self.s.ib.0 != 0 { Some(if self.s.ib.1 == 57 { IndexFormat::Uint16 } else { IndexFormat::Uint32 }) } else { None };
         let mut key: Vec<i64> = vec![vs.uid as i64, ps.map(|p| p.uid as i64).unwrap_or(0), self.s.layout as i64];
+        for p in std::iter::once(vs).chain(ps) {
+            if let Some(m) = self.unfilt.get(&p.uid) { key.extend([-9, m.0 as i64, (m.0 >> 64) as i64]); }
+        }
         let strides: Vec<u32> = (0..16).map(|i| { let v = &self.s.vb[i]; if v.buf != 0 && self.buf(v.buf).map(|b| b.gpu.is_some()).unwrap_or(false) { v.stride } else { 0 } }).collect();
         for &(slot, _) in &layout.slots { key.push(strides[slot as usize] as i64); }
         key.extend([self.s.topo as i64, match strip_fmt { Some(IndexFormat::Uint16) => 1, Some(_) => 2, None => 0 }, self.s.blend.0 as i64, self.s.dss.0 as i64, self.s.rs as i64]);
@@ -2315,7 +2597,8 @@ impl Gpu {
                 if tf != bf { if let Some(name) = wgsl_format_name(tf) { subs.push((b.binding, b.format_name.clone(), name.to_string())); } }
             }
         }
-        let key = format!("{}|{}", prog.uid, subs.iter().map(|s| format!("{}:{}", s.0, s.2)).collect::<Vec<_>>().join(";"));
+        let cmask = self.unfilt.get(&prog.uid).copied().unwrap_or((0, 0));
+        let key = format!("{}|{}|{:x}", prog.uid, subs.iter().map(|s| format!("{}:{}", s.0, s.2)).collect::<Vec<_>>().join(";"), cmask.0);
         if !self.compute.contains_key(&key) {
             let cprog = if subs.is_empty() { prog.clone() } else {
                 let mut text = prog.text.clone();
@@ -2336,7 +2619,7 @@ impl Gpu {
                     None => { self.compute.insert(key.clone(), None); self.skipped += 1; return; }
                 }
             };
-            let entries: Vec<_> = cprog.info.bindings.iter().filter(|b| b.group == 0).map(|b| Self::layout_entry(b, 2)).collect();
+            let entries: Vec<_> = cprog.info.bindings.iter().filter(|b| b.group == 0).map(|b| Self::layout_entry_masked(b, 2, cmask)).collect();
             let bgl = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: None, entries: &entries });
             let layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
             let label = cprog.label.clone();

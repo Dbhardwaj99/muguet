@@ -189,11 +189,15 @@ struct LauncherView: View {
             Text("Play").font(.title3.weight(.semibold)).frame(maxWidth: 220)
         }
         .controlSize(.large)
+        #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             button.buttonStyle(.glassProminent)
         } else {
             button.buttonStyle(.borderedProminent)
         }
+        #else
+        button.buttonStyle(.borderedProminent)
+        #endif
     }
 
     func start() {
