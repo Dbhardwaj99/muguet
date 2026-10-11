@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 #[cfg_attr(target_os = "ios", allow(dead_code))]
+#[derive(Clone)]
 pub struct Startup {
     pub wasm_path: PathBuf,
     pub cache_dir: PathBuf,

@@ -266,7 +266,8 @@ pub fn handle(name: &str, mem: &SharedMemory, p: &[Val], results: &mut [Val]) ->
         "__syscall_statfs64" => (|| {
             if a(1) != 120 { return Err(-EINVAL); }
             let guest = guest_abs(&fs, AT_FDCWD, &read_cstr(mem, a(0) as u64)).map_err(|e| -e)?;
-            let bytes = statfs_bytes(&host_path(&fs, &guest)).map_err(|e| -e)?;
+            let host = host_path(&fs, &guest);
+            let bytes = statfs_bytes(host.ancestors().find(|p| p.exists()).unwrap_or(&host)).map_err(|e| -e)?;
             if !write_bytes(mem, a(2) as u64, &bytes) { return Err(-EFAULT); }
             Ok(0)
         })().unwrap_or_else(|e| e),
