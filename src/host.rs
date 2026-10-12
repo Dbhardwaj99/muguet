@@ -25,6 +25,8 @@ impl std::fmt::Display for LongJmp {
 }
 impl std::error::Error for LongJmp {}
 
+static PAGE_MAPS: LazyLock<Mutex<HashMap<u64, usize>>> = LazyLock::new(Default::default);
+
 static PENDING_MAILBOX: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static ANY_PENDING: AtomicU64 = AtomicU64::new(0);
 static STUB_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +63,20 @@ fn module_int(name: &str, default: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn page_map_grows_only_when_runtime_entries_exceed_asset_capacity() {
+        let mut pages = [0; 16];
+        pages[8] = 3;
+        pages[9] = 1;
+        assert_eq!(super::page_map_growth(&pages, &[3, 2, 0]).unwrap(), Some(56));
+        assert_eq!(super::page_map_growth(&pages, &[3, 1, 0]).unwrap(), None);
+        assert_eq!(super::page_map_growth(&pages, &[2, 1, 0]).unwrap(), None);
+        assert!(super::page_map_growth(&pages, &[128, 1, 0]).is_err());
+        assert!(super::page_map_growth(&[], &[3, 2, 0]).is_err());
+        pages[11] = 1;
+        assert_eq!(super::page_map_growth(&pages, &[3, 2, 0]).unwrap(), None);
+    }
+
+    #[test]
     fn movie_worker_is_kept_without_enabling_other_thread_groups() {
         assert_eq!(super::module_int("keepThreads", 0), 4);
         assert_eq!(super::module_int("keepThreads", 2), 6);
@@ -79,6 +95,54 @@ fn export_call(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val]) -> 
     let mut results: Vec<Val> = ty.results().map(|t| default_val(&t)).collect();
     f.call(&mut *caller, &args, &mut results)?;
     Ok(results)
+}
+
+fn page_map_growth(pages: &[u8], map: &[u8]) -> Result<Option<usize>> {
+    anyhow::ensure!(pages.len() == 16 && map.len() == 3, "invalid resource page map address");
+    let capacity = pages[8] as usize + pages[9] as usize;
+    let count = map[0] as usize + map[1] as usize;
+    anyhow::ensure!(capacity <= 128 && count <= 128, "invalid resource page map count");
+    // Runtime chunk layouts can need more entries than the asset reserved in place.
+    Ok((pages[11] == 0 && count > capacity).then_some(16 + count * 8))
+}
+
+fn grow_page_map(caller: &mut Caller<'_, HostState>, object: u64, resource: u64) -> Result<u64> {
+    let mem = &RT.get().expect("runtime").mem;
+    let pages = read_u64(mem, object + 8).unwrap_or(0);
+    // Before relocation, a zero resource queries whether this map is already external.
+    if resource == 0 { return Ok(PAGE_MAPS.lock().unwrap().contains_key(&pages) as u64); }
+    if pages == 0 { return Ok(pages); }
+    let map = read_u64(mem, resource).unwrap_or(0);
+    let header = crate::read_bytes(mem, pages, 16);
+    let Some(size) = page_map_growth(&header, &crate::read_bytes(mem, map, 3))? else { return Ok(pages) };
+    if PAGE_MAPS.lock().unwrap().get(&pages).is_some_and(|&capacity| capacity >= size) { return Ok(pages); }
+    let alloc = export_call(caller, "muguet:malloc", &[Val::I64(size as i64)])?;
+    let new_pages = int(&alloc, 0) as u64;
+    anyhow::ensure!(new_pages != 0, "cannot grow resource page map");
+    let mut bytes = vec![0; size];
+    bytes[..16].copy_from_slice(&header);
+    if !write_bytes(mem, new_pages, &bytes) {
+        export_call(caller, "muguet:free", &[Val::I64(new_pages as i64)])?;
+        anyhow::bail!("invalid allocated page map address");
+    }
+    let old = {
+        let mut maps = PAGE_MAPS.lock().unwrap();
+        let old = maps.remove(&pages);
+        maps.insert(new_pages, size);
+        old
+    };
+    if old.is_some() { export_call(caller, "muguet:free", &[Val::I64(pages as i64)])?; }
+    eprintln!("[host] expanded page map for {}: {} -> {} entries (object 0x{object:x})", read_cstr(mem, read_u64(mem, resource + 16).unwrap_or(0)), header[8] as usize + header[9] as usize, (size - 16) / 8);
+    Ok(new_pages)
+}
+
+fn free_page_map(caller: &mut Caller<'_, HostState>, object: u64) -> Result<()> {
+    let pages = read_u64(&RT.get().expect("runtime").mem, object + 8).unwrap_or(0);
+    let expanded = PAGE_MAPS.lock().unwrap().remove(&pages).is_some();
+    if expanded {
+        export_call(caller, "muguet:free", &[Val::I64(pages as i64)])?;
+    }
+    Ok(())
 }
 
 // labels the scripts print that no loaded text block has (the copy in arm1.gxt2 only loads during that mission)
@@ -140,6 +204,11 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         "muguet_explosion" => crate::mp::explosion(int(params, 0) as u64),
         "muguet_timewarp" => set_int(results, crate::mp::time_warp(int(params, 0))),
         "muguet_text" => set_int(results, missing_text(&mut caller, int(params, 0) as u32)? as i64),
+        "muguet_pagemap" => {
+            let pages = grow_page_map(&mut caller, int(params, 0) as u64, int(params, 1) as u64)?;
+            set_int(results, pages as i64);
+        }
+        "muguet_free_pagemap" => free_page_map(&mut caller, int(params, 0) as u64)?,
         "__pthread_create_js" => {
             let r = spawn_pthread(int(params, 0) as u64, int(params, 2) as u64, int(params, 3) as u64);
             set_int(results, r as i64);
